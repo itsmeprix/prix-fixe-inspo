@@ -1,5 +1,4 @@
-// Streams the image bytes from FilmGrab to your client (so <img> loads from your origin)
-
+// Streams an image to the client with multiple fallbacks (Referer, no-Referer, WP Photon CDN).
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -7,54 +6,79 @@ export default async function handler(req, res) {
 
   const src = Array.isArray(req.query.src) ? req.query.src[0] : req.query.src;
   const ref = Array.isArray(req.query.ref) ? req.query.ref[0] : req.query.ref;
+  if (!src) return res.status(400).send("Missing ?src=IMAGE_URL");
 
-  if (!src) { res.status(400).send("Missing ?src=IMAGE_URL"); return; }
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-  const UA =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36";
+  const acceptImg = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
 
-  // Two attempts: with referer (post URL or site root), then without
-  const attempts = [
-    {
-      headers: {
-        "user-agent":     UA,
-        "accept":         "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "accept-language":"en-US,en;q=0.9",
-        "referer":        ref || "https://film-grab.com/",
-      },
-    },
-    {
-      headers: {
-        "user-agent": UA,
-        "accept":     "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "accept-language":"en-US,en;q=0.9",
-        "referer":    "",
-      },
-    },
-  ];
+  const headersWithRef = {
+    "user-agent": UA,
+    "accept": acceptImg,
+    "accept-language": "en-US,en;q=0.9",
+    "referer": ref || "https://film-grab.com/",
+    "origin": "https://film-grab.com",
+    "sec-fetch-site": "same-site",
+    "sec-fetch-mode": "no-cors",
+    "sec-fetch-dest": "image"
+  };
 
-  try {
-    let upstream, lastErr;
-    for (const opt of attempts) {
-      try {
-        upstream = await fetch(src, { ...opt, redirect: "follow" });
-        if (upstream.ok) break;
-        lastErr = new Error("Status " + upstream.status);
-      } catch (e) { lastErr = e; }
+  const headersNoRef = {
+    "user-agent": UA,
+    "accept": acceptImg,
+    "accept-language": "en-US,en;q=0.9",
+    "referer": ""
+  };
+
+  // Build WordPress Photon (Jetpack CDN) variants
+  function toPhoton(u) {
+    try {
+      const x = new URL(u);
+      const full = x.host + x.pathname + (x.search || "");
+      // Variant A: preserve query + ssl
+      const A = "https://i0.wp.com/" + full + (x.search ? "&" : "?") + "ssl=1";
+      // Variant B: strip query, just force ssl
+      const B = "https://i0.wp.com/" + x.host + x.pathname + "?ssl=1";
+      return [A, B];
+    } catch {
+      return [];
     }
-
-    if (!upstream || !upstream.ok) {
-      res.status(502).send("Upstream fetch failed.");
-      return;
-    }
-
-    const ct = upstream.headers.get("content-type") || "image/jpeg";
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600");
-
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.status(200).send(buf);
-  } catch (e) {
-    res.status(500).send("Proxy error: " + (e.message || "unknown"));
   }
-}
+
+  async function tryFetch(url, headers) {
+    try {
+      const r = await fetch(url, { headers, redirect: "follow" });
+      if (!r.ok) return null;
+      return r;
+    } catch { return null; }
+  }
+
+  // Attempt order:
+  // 1) original URL with Referer
+  // 2) original URL without Referer
+  // 3) photon variant A with Referer
+  // 4) photon variant B with Referer
+  // 5) photon variant A without Referer
+  // 6) photon variant B without Referer
+  const attempts = [];
+  attempts.push({ url: src, headers: headersWithRef });
+  attempts.push({ url: src, headers: headersNoRef });
+
+  const [photonA, photonB] = toPhoton(src);
+  if (photonA) attempts.push({ url: photonA, headers: headersWithRef });
+  if (photonB) attempts.push({ url: photonB, headers: headersWithRef });
+  if (photonA) attempts.push({ url: photonA, headers: headersNoRef });
+  if (photonB) attempts.push({ url: photonB, headers: headersNoRef });
+
+  let upstream = null;
+  for (const a of attempts) {
+    upstream = await tryFetch(a.url, a.headers);
+    if (upstream) break;
+  }
+
+  if (!upstream) return res.status(502).send("Upstream fetch failed.");
+
+  const ct = upstream.headers.get("content-type") || "image/jpeg";
+  res.setHeader("Content-Type", ct);
+  res.setHeader(
